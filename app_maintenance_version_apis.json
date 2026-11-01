@@ -1,0 +1,599 @@
+{
+  "meta": {
+    "title": "Synap Mentor — Mobile App Maintenance Mode & Version Update APIs",
+    "generated": "2026-10-24",
+    "base_url": "/api/v1",
+    "scope": "iOS and Android apps only. A request counts as a mobile-app request when its X-App-Platform header is 'ios' or 'android' (case-insensitive). Requests with X-App-Platform 'web', or with no X-App-Platform, are never blocked by maintenance mode, so the web apps and their APIs behave exactly as before.",
+    "verified": "All endpoints and every error path below were called against the running API on 2026-10-24, with both platforms. The example bodies are the real responses from those calls. IDs, timestamps and request_id values come from that test run and will differ in your environment. The store URLs are placeholders.",
+    "verified_event_artwork": "The two community-event artwork endpoints (solver-upload-event-poster, solver-upload-event-cover) were added on 2026-10-24. Called live with X-App-Platform android and no token: both return 401 'Authentication required', which confirms the routes are registered and reachable from the app. Every other error body and the success shape are traced from the handler and service code, not called live: a successful call replaces a real event's artwork and deletes the old file from R2. The upload itself was exercised from the SolverUI, and the resulting R2 objects (image/png, with event metadata) were confirmed in the bucket.",
+    "source": {
+      "schema": "Backend/schema.sql (tables mobile_app_maintenance, mobile_app_versions)",
+      "repository": "Backend/internal/adapter/db/postgres/mobile_app_repository.go",
+      "service": "Backend/internal/core/usecases/mobile_app_service.go",
+      "handler": "Backend/internal/adapter/http/handlers/mobile_app_handler.go",
+      "middleware": "Backend/pkg/middleware/mobile_maintenance.go (registered globally at Backend/cmd/main.go:3328)",
+      "routes": "Backend/internal/adapter/http/routes/routes.go:1804-1807 (admin), routes.go:2287-2288 (public)",
+      "admin_ui": "SynapUI/apps/AdminUI/src/pages/settings/MobileMaintenanceSettings.tsx (Admin → Platform Settings → Mobile App tab). Version management has no admin UI; it is API-only.",
+      "event_artwork": "Backend/schema.sql:8076 (community_events.poster_url, cover_image_url); routes.go:1481-1482; community_handler.go:3050-3060; community_service.go:4626 (SetEventImage), :4678 (read-side URL signing); community_repository.go:2351 (SetEventImage); r2_client.go:396 (UploadCommunityEventImage)"
+    }
+  },
+
+  "common": {
+    "client_headers": {
+      "X-App-Platform": "ios | android. Mobile apps must send it on every request. It also identifies the request as mobile for maintenance mode.",
+      "X-App-Version": "MAJOR.MINOR.PATCH of the installed app, e.g. 1.4.2. The existing ClientContextMiddleware validates it on every request and returns 400 if it is malformed.",
+      "User-Agent": "Required in production (CLIENT_REQUIRE_HEADERS=true)."
+    },
+    "response_envelope": {
+      "success": "boolean",
+      "data": "object (on success)",
+      "error": "string (on failure)",
+      "code": "string (machine-readable error code, where one is listed)",
+      "message": "string (human-readable confirmation on admin writes)"
+    },
+    "version_format": "Strict MAJOR.MINOR.PATCH, three unsigned integers of 1-6 digits each. Rejected: '1.2', '1.2.3.4', 'v1.2.3', '-1.2.3', '+1.2.3', '1.2.3-beta', '1.2.3+45'. Parts are compared as numbers, so 1.10.0 is newer than 1.4.0. Leading zeros are normalised in responses ('01.2.3' becomes '1.2.3').",
+    "admin_auth": "The admin endpoints sit in the /api/v1/admin group, which runs AuthMiddleware and then RequireRole('admin'). The admin panel authenticates with the PASETO access_token cookie from POST /api/v1/auth/admin/login. Because the session is cookie-based, a POST also needs the X-CSRF-Token header, set to the value of the csrf_token cookie.",
+    "rate_limits": "The public endpoints are covered by the /public group limiter, RateLimitGlobal(RATE_LIMIT_GLOBAL_PER_HOUR, default 1000/hour per IP). The admin endpoints are covered by the global stack only.",
+    "caching": "The maintenance state is cached in memory for 10 seconds, and release info for 30 seconds. An admin change applies immediately on the instance that handled it. Other instances pick it up within the cache window."
+  },
+
+  "maintenance_mode_behaviour": {
+    "when_enabled": "Every mobile-app request (X-App-Platform ios/android) gets HTTP 503, with the admin's message, as long as its path is not on the exempt list below. This includes login, refresh, all seeker/solver APIs, the public APIs and the WebSocket upgrade.",
+    "exempt_paths": [
+      "/api/v1/public/app/*  (maintenance status + version check, so the app can still show the message and a forced update)",
+      "/api/v1/admin, /api/v1/admin/*  (admin APIs; these still require an admin session)",
+      "/api/v1/auth/admin/*  (admin login/refresh/logout)",
+      "/health, /api/v1/health",
+      "any OPTIONS (CORS preflight) request"
+    ],
+    "never_affected": "Requests with X-App-Platform 'web' or with no X-App-Platform: the SeekerUI, SolverUI, AdminUI and LandingPage web apps, webhooks, and server-to-server calls.",
+    "blocked_response": {
+      "status": 503,
+      "body": {
+        "success": false,
+        "error": "Scheduled upgrade in progress.\nBack by 02:00 UTC.",
+        "code": "MAINTENANCE_MODE",
+        "data": {
+          "maintenance_enabled": true,
+          "message": "Scheduled upgrade in progress.\nBack by 02:00 UTC."
+        },
+        "meta": {
+          "timestamp": "2026-10-24T00:07:58+02:00",
+          "request_id": "01a16ace-775e-71ff-b0a5-6c1e0b2f9d11"
+        }
+      }
+    },
+    "recommended_client_flow": [
+      "1. At launch, call GET /api/v1/public/app/version-check. If update_type is 'mandatory', show a blocking update screen that links to download_url. If it is 'optional', show a dismissible prompt.",
+      "2. Call GET /api/v1/public/app/maintenance. If maintenance_enabled is true, show the message on a full-screen maintenance view and poll this endpoint (for example every 60 s) until it returns false.",
+      "3. Treat any API response with HTTP 503 and code MAINTENANCE_MODE as a switch to the maintenance view, using data.message. This covers maintenance that starts while the app is open."
+    ]
+  },
+
+  "endpoints": [
+    {
+      "id": "public-maintenance-status",
+      "method": "GET",
+      "path": "/api/v1/public/app/maintenance",
+      "summary": "Current mobile-app maintenance status and message. The app calls it at launch and while it shows the maintenance screen.",
+      "handler": "mobile_app_handler.go:36 MobileAppHandler.GetMaintenanceStatus",
+      "auth": { "required": false, "roles": [], "csrf": false },
+      "exempt_from_maintenance": true,
+      "request": { "headers": ["X-App-Platform", "X-App-Version", "User-Agent"], "query_params": [], "body": null },
+      "response_fields": {
+        "maintenance_enabled": "boolean",
+        "message": "string. The admin's message while maintenance is on; an empty string while it is off."
+      },
+      "examples": [
+        {
+          "name": "android — maintenance off",
+          "request": "GET /api/v1/public/app/maintenance\nX-App-Platform: android\nX-App-Version: 1.2.0",
+          "status": 200,
+          "response": { "success": true, "data": { "maintenance_enabled": false, "message": "" } }
+        },
+        {
+          "name": "ios — maintenance on",
+          "request": "GET /api/v1/public/app/maintenance\nX-App-Platform: ios\nX-App-Version: 1.2.0",
+          "status": 200,
+          "response": { "success": true, "data": { "maintenance_enabled": true, "message": "Scheduled upgrade in progress.\nBack by 02:00 UTC." } }
+        }
+      ],
+      "errors": [
+        { "status": 400, "when": "X-App-Platform / X-App-Version present but malformed (ClientContextMiddleware)", "body": { "success": false, "error": "Invalid X-App-Version header. Must be in semantic version format (e.g., 1.2.3)" } },
+        { "status": 429, "when": "Per-IP global rate limit exceeded" }
+      ]
+    },
+
+    {
+      "id": "public-version-check",
+      "method": "GET",
+      "path": "/api/v1/public/app/version-check",
+      "summary": "Compares the installed app version with the platform's release info, and returns whether an update is available, whether it is mandatory, and where to download it.",
+      "handler": "mobile_app_handler.go:49 MobileAppHandler.CheckForUpdate",
+      "auth": { "required": false, "roles": [], "csrf": false },
+      "exempt_from_maintenance": true,
+      "request": {
+        "headers": ["X-App-Platform", "X-App-Version", "User-Agent"],
+        "query_params": [
+          { "name": "platform", "type": "string enum: ios|android (case-insensitive)", "required": "yes; falls back to the X-App-Platform header if omitted" },
+          { "name": "version", "type": "string MAJOR.MINOR.PATCH", "required": "yes; falls back to the X-App-Version header if omitted" }
+        ],
+        "body": null
+      },
+      "decision_rules": [
+        "installed < min_supported_version → update_type 'mandatory'",
+        "installed < latest_version and the release is_mandatory → 'mandatory'",
+        "installed < latest_version → 'optional'",
+        "installed >= latest_version (including newer internal builds) → 'none'"
+      ],
+      "response_fields": {
+        "platform": "ios | android",
+        "current_version": "string, the normalised installed version",
+        "latest_version": "string",
+        "min_supported_version": "string",
+        "update_available": "boolean. True whenever update_type is not 'none'.",
+        "is_mandatory": "boolean. True when THIS install must update before it can be used.",
+        "update_type": "none | optional | mandatory",
+        "download_url": "string. App Store / Play Store URL; empty until an admin sets it.",
+        "release_notes": "string, may be empty"
+      },
+      "examples": [
+        {
+          "name": "android — optional update (1.2.0 → 1.4.0, min 1.1.0, not mandatory)",
+          "request": "GET /api/v1/public/app/version-check?platform=android&version=1.2.0",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "platform": "android",
+              "current_version": "1.2.0",
+              "latest_version": "1.4.0",
+              "min_supported_version": "1.1.0",
+              "update_available": true,
+              "is_mandatory": false,
+              "update_type": "optional",
+              "download_url": "https://play.google.com/store/apps/details?id=com.synapmentor.app",
+              "release_notes": "Bug fixes"
+            }
+          }
+        },
+        {
+          "name": "android — mandatory, installed version is below min_supported_version",
+          "request": "GET /api/v1/public/app/version-check?platform=android&version=1.0.9",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "platform": "android",
+              "current_version": "1.0.9",
+              "latest_version": "1.4.0",
+              "min_supported_version": "1.1.0",
+              "update_available": true,
+              "is_mandatory": true,
+              "update_type": "mandatory",
+              "download_url": "https://play.google.com/store/apps/details?id=com.synapmentor.app",
+              "release_notes": "Bug fixes"
+            }
+          }
+        },
+        {
+          "name": "ios — mandatory because the latest release is flagged is_mandatory",
+          "request": "GET /api/v1/public/app/version-check?platform=ios&version=2.2.0",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "platform": "ios",
+              "current_version": "2.2.0",
+              "latest_version": "2.3.0",
+              "min_supported_version": "2.0.0",
+              "update_available": true,
+              "is_mandatory": true,
+              "update_type": "mandatory",
+              "download_url": "https://apps.apple.com/app/id0000000000",
+              "release_notes": "Security fix"
+            }
+          }
+        },
+        {
+          "name": "ios — up to date (query omitted, headers used)",
+          "request": "GET /api/v1/public/app/version-check\nX-App-Platform: ios\nX-App-Version: 1.0.0",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "platform": "ios",
+              "current_version": "1.0.0",
+              "latest_version": "1.0.0",
+              "min_supported_version": "1.0.0",
+              "update_available": false,
+              "is_mandatory": false,
+              "update_type": "none",
+              "download_url": "",
+              "release_notes": ""
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 400, "code": "INVALID_PLATFORM", "when": "platform missing (no query param and no header)", "body": { "success": false, "error": "platform is required (ios or android)", "code": "INVALID_PLATFORM" } },
+        { "status": 400, "code": "INVALID_PLATFORM", "when": "platform is 'web' or any value other than ios/android", "body": { "success": false, "error": "platform must be one of: ios, android", "code": "INVALID_PLATFORM" } },
+        { "status": 400, "code": "INVALID_VERSION", "when": "version missing (no query param and no header)", "body": { "success": false, "error": "version is required (MAJOR.MINOR.PATCH)", "code": "INVALID_VERSION" } },
+        { "status": 400, "code": "INVALID_VERSION", "when": "version not strict MAJOR.MINOR.PATCH (e.g. '1.2', '-1.2.3', '1.2.3-beta')", "body": { "success": false, "error": "version must be in MAJOR.MINOR.PATCH format (e.g. 1.4.2)", "code": "INVALID_VERSION" } },
+        { "status": 400, "code": "INVALID_INPUT", "when": "platform longer than 16 or version longer than 32 characters", "body": { "success": false, "error": "platform or version value too long", "code": "INVALID_INPUT" } },
+        { "status": 404, "code": "VERSION_NOT_CONFIGURED", "when": "No release row exists for the platform. Both rows are seeded by schema.sql, so this only happens on a hand-edited DB.", "body": { "success": false, "error": "No release is configured for this platform", "code": "VERSION_NOT_CONFIGURED" } },
+        { "status": 429, "when": "Per-IP global rate limit exceeded" },
+        { "status": 500, "when": "Database failure", "body": { "success": false, "error": "Failed to check for updates" } }
+      ]
+    },
+
+    {
+      "id": "admin-get-maintenance",
+      "method": "GET",
+      "path": "/api/v1/admin/app/maintenance",
+      "summary": "Admin view of the maintenance switch, read straight from the database (not cached).",
+      "handler": "mobile_app_handler.go:86 MobileAppHandler.AdminGetMaintenance",
+      "auth": { "required": true, "roles": ["admin"], "csrf": false },
+      "exempt_from_maintenance": true,
+      "request": { "headers": ["Cookie: access_token=<admin PASETO>"], "query_params": [], "body": null },
+      "examples": [
+        {
+          "name": "maintenance off (seeded default)",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "enabled": false,
+              "message": "The app is under maintenance. Please try again shortly.",
+              "updated_at": "2026-10-24T00:02:00.670329+02:00"
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 401, "when": "No or expired admin session", "body": { "success": false, "error": "Authentication required" } },
+        { "status": 403, "when": "Authenticated, but the user is not an admin (RequireRole)" },
+        { "status": 500, "body": { "success": false, "error": "Failed to load maintenance settings" } }
+      ]
+    },
+
+    {
+      "id": "admin-update-maintenance",
+      "method": "POST",
+      "path": "/api/v1/admin/app/maintenance",
+      "summary": "Turns mobile maintenance on or off and optionally replaces the message. Each call writes an admin_audit_logs row (target_type 'platform'; action mobile_maintenance_enabled, mobile_maintenance_disabled or mobile_maintenance_updated).",
+      "handler": "mobile_app_handler.go:99 MobileAppHandler.AdminUpdateMaintenance",
+      "auth": { "required": true, "roles": ["admin"], "csrf": true },
+      "exempt_from_maintenance": true,
+      "request": {
+        "content_type": "application/json",
+        "headers": ["Cookie: access_token=<admin PASETO>", "X-CSRF-Token: <csrf_token cookie value>"],
+        "body": {
+          "enabled": "boolean (required)",
+          "message": "string (optional; when omitted the stored message is kept). Trimmed; 1-500 characters; newlines and tabs allowed; other control characters rejected."
+        },
+        "required_fields": ["enabled"]
+      },
+      "examples": [
+        {
+          "name": "enable with a message",
+          "request_body": { "enabled": true, "message": "Scheduled upgrade in progress.\nBack by 02:00 UTC." },
+          "status": 200,
+          "response": {
+            "success": true,
+            "message": "Maintenance settings updated",
+            "data": {
+              "enabled": true,
+              "message": "Scheduled upgrade in progress.\nBack by 02:00 UTC.",
+              "updated_by": "01a16836-d6cf-762a-9b61-c2bfb42eea84",
+              "updated_at": "2026-10-24T00:07:58.102371+02:00"
+            }
+          }
+        },
+        {
+          "name": "disable, keeping the stored message",
+          "request_body": { "enabled": false },
+          "status": 200,
+          "response": {
+            "success": true,
+            "message": "Maintenance settings updated",
+            "data": {
+              "enabled": false,
+              "message": "Scheduled upgrade in progress.\nBack by 02:00 UTC.",
+              "updated_by": "01a16836-d6cf-762a-9b61-c2bfb42eea84",
+              "updated_at": "2026-10-24T00:13:18.489569+02:00"
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 400, "when": "Body is not valid JSON, or a field has the wrong type (e.g. \"enabled\": \"yes\")", "body": { "success": false, "error": "Invalid request format" } },
+        { "status": 400, "when": "enabled missing", "body": { "success": false, "error": "Validation failed: enabled (true/false) is required" } },
+        { "status": 400, "when": "message blank or whitespace only", "body": { "success": false, "error": "message cannot be empty" } },
+        { "status": 400, "when": "message over 500 characters", "body": { "success": false, "error": "message must be at most 500 characters" } },
+        { "status": 400, "when": "message contains control characters other than \\n / \\t", "body": { "success": false, "error": "message contains invalid control characters" } },
+        { "status": 401, "body": { "success": false, "error": "Authentication required" } },
+        { "status": 403, "when": "Not an admin, or the CSRF token is missing or wrong", "body": { "success": false, "error": "CSRF token missing" } },
+        { "status": 500, "body": { "success": false, "error": "Failed to update maintenance settings" } }
+      ]
+    },
+
+    {
+      "id": "admin-list-versions",
+      "method": "GET",
+      "path": "/api/v1/admin/app/versions",
+      "summary": "Release info for both platforms (not cached). API only; there is no admin UI.",
+      "handler": "mobile_app_handler.go:127 MobileAppHandler.AdminListVersions",
+      "auth": { "required": true, "roles": ["admin"], "csrf": false },
+      "exempt_from_maintenance": true,
+      "examples": [
+        {
+          "name": "seeded defaults",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "versions": [
+                {
+                  "id": "01a16ac9-0276-72a6-a6e4-1c92f32b77a8",
+                  "platform": "android",
+                  "latest_version": "1.0.0",
+                  "min_supported_version": "1.0.0",
+                  "download_url": "",
+                  "is_mandatory": false,
+                  "release_notes": "",
+                  "created_at": "2026-10-24T00:02:00.692167+02:00",
+                  "updated_at": "2026-10-24T00:02:00.692167+02:00"
+                },
+                {
+                  "id": "01a16ac9-0275-70b0-b530-fa583e1673d0",
+                  "platform": "ios",
+                  "latest_version": "1.0.0",
+                  "min_supported_version": "1.0.0",
+                  "download_url": "",
+                  "is_mandatory": false,
+                  "release_notes": "",
+                  "created_at": "2026-10-24T00:02:00.692167+02:00",
+                  "updated_at": "2026-10-24T00:02:00.692167+02:00"
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 401, "body": { "success": false, "error": "Authentication required" } },
+        { "status": 403, "when": "Not an admin" },
+        { "status": 500, "body": { "success": false, "error": "Failed to load app versions" } }
+      ]
+    },
+
+    {
+      "id": "admin-update-version",
+      "method": "POST",
+      "path": "/api/v1/admin/app/versions/:platform",
+      "summary": "Replaces one platform's release info as a whole (API only, no admin UI). Each call writes an admin_audit_logs row (target_type 'platform', action mobile_app_version_updated) with the before and after state.",
+      "handler": "mobile_app_handler.go:140 MobileAppHandler.AdminUpdateVersion",
+      "auth": { "required": true, "roles": ["admin"], "csrf": true },
+      "exempt_from_maintenance": true,
+      "request": {
+        "path_params": [{ "name": "platform", "type": "string enum: ios|android" }],
+        "content_type": "application/json",
+        "headers": ["Cookie: access_token=<admin PASETO>", "X-CSRF-Token: <csrf_token cookie value>"],
+        "body": {
+          "latest_version": "string MAJOR.MINOR.PATCH (required)",
+          "min_supported_version": "string MAJOR.MINOR.PATCH (required, must be <= latest_version)",
+          "download_url": "string (required). An absolute https:// URL with no credentials, at most 2048 characters.",
+          "is_mandatory": "boolean (required). When true, every install older than latest_version must update.",
+          "release_notes": "string (optional, at most 2000 characters; defaults to empty)"
+        },
+        "required_fields": ["latest_version", "min_supported_version", "download_url", "is_mandatory"]
+      },
+      "examples": [
+        {
+          "name": "android release",
+          "request": "POST /api/v1/admin/app/versions/android",
+          "request_body": {
+            "latest_version": "1.4.0",
+            "min_supported_version": "1.1.0",
+            "download_url": "https://play.google.com/store/apps/details?id=com.synapmentor.app",
+            "is_mandatory": false,
+            "release_notes": "Bug fixes"
+          },
+          "status": 200,
+          "response": {
+            "success": true,
+            "message": "App version updated",
+            "data": {
+              "id": "01a16ac9-0276-72a6-a6e4-1c92f32b77a8",
+              "platform": "android",
+              "latest_version": "1.4.0",
+              "min_supported_version": "1.1.0",
+              "download_url": "https://play.google.com/store/apps/details?id=com.synapmentor.app",
+              "is_mandatory": false,
+              "release_notes": "Bug fixes",
+              "updated_by": "01a16836-d6cf-762a-9b61-c2bfb42eea84",
+              "created_at": "2026-10-24T00:02:00.692167+02:00",
+              "updated_at": "2026-10-24T00:07:58.070994+02:00"
+            }
+          }
+        },
+        {
+          "name": "ios mandatory release",
+          "request": "POST /api/v1/admin/app/versions/ios",
+          "request_body": {
+            "latest_version": "2.3.0",
+            "min_supported_version": "2.0.0",
+            "download_url": "https://apps.apple.com/app/id0000000000",
+            "is_mandatory": true,
+            "release_notes": "Security fix"
+          },
+          "status": 200,
+          "response": {
+            "success": true,
+            "message": "App version updated",
+            "data": {
+              "id": "01a16ac9-0275-70b0-b530-fa583e1673d0",
+              "platform": "ios",
+              "latest_version": "2.3.0",
+              "min_supported_version": "2.0.0",
+              "download_url": "https://apps.apple.com/app/id0000000000",
+              "is_mandatory": true,
+              "release_notes": "Security fix",
+              "updated_by": "01a16836-d6cf-762a-9b61-c2bfb42eea84",
+              "created_at": "2026-10-24T00:02:00.692167+02:00",
+              "updated_at": "2026-10-24T00:13:18.411772+02:00"
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 400, "code": "INVALID_PLATFORM", "when": ":platform is not ios/android (e.g. 'web')", "body": { "success": false, "error": "platform must be one of: ios, android", "code": "INVALID_PLATFORM" } },
+        { "status": 400, "when": "Body is not valid JSON, or a field has the wrong type", "body": { "success": false, "error": "Invalid request format" } },
+        { "status": 400, "when": "A required field is missing (including is_mandatory)", "body": { "success": false, "error": "Validation failed: latest_version, min_supported_version, download_url and is_mandatory are required" } },
+        { "status": 400, "when": "latest_version malformed", "body": { "success": false, "error": "latest_version must be in MAJOR.MINOR.PATCH format" } },
+        { "status": 400, "when": "min_supported_version malformed", "body": { "success": false, "error": "min_supported_version must be in MAJOR.MINOR.PATCH format" } },
+        { "status": 400, "when": "min_supported_version > latest_version", "body": { "success": false, "error": "min_supported_version cannot be greater than latest_version" } },
+        { "status": 400, "when": "download_url is not an absolute https URL (http://, javascript:, a relative path, or contains credentials)", "body": { "success": false, "error": "download_url must be an absolute https:// URL" } },
+        { "status": 400, "when": "release_notes over 2000 characters", "body": { "success": false, "error": "release_notes must be at most 2000 characters" } },
+        { "status": 401, "body": { "success": false, "error": "Authentication required" } },
+        { "status": 403, "when": "Not an admin, or the CSRF token is missing or wrong" },
+        { "status": 500, "body": { "success": false, "error": "Failed to update app version" } }
+      ]
+    },
+    {
+      "id": "solver-upload-event-poster",
+      "method": "POST",
+      "path": "/api/v1/solver/community/events/:event_id/poster",
+      "summary": "Uploads (or replaces) a community event's POSTER: the portrait flyer shown in full beside the event details. Only the owner of the hosting community can call it, and only while the event is upcoming or ongoing. Uploading artwork does NOT use up the host's one-time event edit. A replaced poster is deleted from storage.",
+      "handler": "community_handler.go:3050 CommunityHandler.UploadEventPoster → uploadEventImage (community_handler.go:3060) → CommunityService.SetEventImage (community_service.go:4626)",
+      "auth": {
+        "required": true,
+        "roles": ["solver"],
+        "csrf": false,
+        "note": "Mobile apps send Authorization: Bearer <access_token> with X-App-Platform ios/android and no auth cookies; CSRF is skipped in that case. Ownership of the event's community is checked in the service, not by the role."
+      },
+      "exempt_from_maintenance": false,
+      "request": {
+        "path_params": [
+          { "name": "event_id", "type": "string UUID of the community event" }
+        ],
+        "content_type": "multipart/form-data",
+        "headers": [
+          "Authorization: Bearer <solver access_token>",
+          "X-App-Platform",
+          "X-App-Version",
+          "User-Agent"
+        ],
+        "body": {
+          "file": "binary (required, multipart field name 'file'). JPG, PNG, WebP or GIF, at most 5 MB (5242880 bytes). The type is detected from the file's bytes; the filename and the part's Content-Type are ignored, so SVG or a renamed file is rejected."
+        },
+        "recommended_size": "Portrait, e.g. 1080×1350 (4:5). It is displayed uncropped."
+      },
+      "checks_in_order": [
+        "1. Authenticated solver (401 / 403)",
+        "2. event_id is a UUID (400)",
+        "3. A 'file' part is present (400)",
+        "4. File is at most 5 MB (400)",
+        "5. File bytes are JPG / PNG / WebP / GIF (400)",
+        "6. Event exists (404)",
+        "7. Event belongs to a community (platform-wide events are admin-managed) and the caller owns that community (403; 404 if the community is gone)",
+        "8. The community is active, not archived or admin-locked (403)",
+        "9. The event is upcoming or ongoing, not completed or cancelled (409)"
+      ],
+      "response_fields": {
+        "poster_url": "string. A signed R2 URL for the new poster, valid for 10 minutes. Show it straight away, but do not store it: re-read the event to get a fresh URL."
+      },
+      "read_side": "After upload, the poster appears as poster_url on GET /api/v1/events, GET /api/v1/events/:event_id and GET /api/v1/events/calendar (omitted when the event has no poster). Each read returns a fresh signed URL valid for 10 minutes. The stored value is the R2 key communities/<community_id>/events/<event_id>/poster/<timestamp>-poster.<ext>.",
+      "examples": [
+        {
+          "name": "poster uploaded (shape from the handler; not called live, see meta.verified)",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "poster_url": "<signed R2 GET URL for communities/<community_id>/events/<event_id>/poster/20261023205524-poster.png, expires in 600 s>"
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 400, "when": "event_id is not a UUID", "body": { "success": false, "error": "Invalid event ID" } },
+        { "status": 400, "when": "No multipart part named 'file' (or the body is not multipart)", "body": { "success": false, "error": "No file provided" } },
+        { "status": 400, "when": "File larger than 5 MB", "body": { "success": false, "error": "Image must be under 5MB" } },
+        { "status": 400, "when": "File is empty or not a JPG / PNG / WebP / GIF", "body": { "success": false, "error": "Image must be a JPG, PNG, WebP or GIF" } },
+        { "status": 401, "when": "No or invalid access token (verified live)", "body": { "success": false, "error": "Authentication required" } },
+        { "status": 403, "when": "Logged in, but not as a solver", "body": { "success": false, "error": "You do not have permission to access this resource" } },
+        { "status": 403, "when": "The caller does not own the event's community, or the event is platform-wide", "body": { "success": false, "error": "You are not authorized to perform this action" } },
+        { "status": 403, "when": "The community is archived or locked", "body": { "success": false, "error": "Community is not active" } },
+        { "status": 404, "when": "No event with this id", "body": { "success": false, "error": "Event not found" } },
+        { "status": 404, "when": "The event's community no longer exists", "body": { "success": false, "error": "Community not found" } },
+        { "status": 409, "when": "The event has ended or was cancelled", "body": { "success": false, "error": "artwork can only be changed before the event ends" } },
+        { "status": 500, "when": "Storage unavailable, or the R2 upload / database write failed (an uploaded file is cleaned up)", "body": { "success": false, "error": "Failed to upload poster" } },
+        { "status": 503, "code": "MAINTENANCE_MODE", "when": "Maintenance mode is on (this path is not exempt)", "body": "see maintenance_mode_behaviour.blocked_response" }
+      ]
+    },
+    {
+      "id": "solver-upload-event-cover",
+      "method": "POST",
+      "path": "/api/v1/solver/community/events/:event_id/cover",
+      "summary": "Uploads (or replaces) a community event's COVER: the wide banner shown across the top of event cards (cards fall back to the poster when there is no cover). The details view shows the poster only, never the cover. Same rules as the poster endpoint: owner of the hosting community only, while the event is upcoming or ongoing, does not use up the one-time event edit, and a replaced cover is deleted from storage.",
+      "handler": "community_handler.go:3056 CommunityHandler.UploadEventCover → uploadEventImage (community_handler.go:3060) → CommunityService.SetEventImage (community_service.go:4626)",
+      "auth": {
+        "required": true,
+        "roles": ["solver"],
+        "csrf": false,
+        "note": "Same as solver-upload-event-poster."
+      },
+      "exempt_from_maintenance": false,
+      "request": {
+        "path_params": [
+          { "name": "event_id", "type": "string UUID of the community event" }
+        ],
+        "content_type": "multipart/form-data",
+        "headers": [
+          "Authorization: Bearer <solver access_token>",
+          "X-App-Platform",
+          "X-App-Version",
+          "User-Agent"
+        ],
+        "body": {
+          "file": "binary (required, multipart field name 'file'). JPG, PNG, WebP or GIF, at most 5 MB (5242880 bytes). Type detected from the file's bytes, as for the poster."
+        },
+        "recommended_size": "Wide, e.g. 1600×700. Cards show it at 16:7, cropped to fill."
+      },
+      "checks_in_order": "Identical to solver-upload-event-poster.",
+      "response_fields": {
+        "cover_image_url": "string. A signed R2 URL for the new cover, valid for 10 minutes. Do not store it; re-read the event for a fresh URL."
+      },
+      "read_side": "After upload, the cover appears as cover_image_url on GET /api/v1/events, GET /api/v1/events/:event_id and GET /api/v1/events/calendar (omitted when the event has no cover). The stored value is the R2 key communities/<community_id>/events/<event_id>/cover/<timestamp>-cover.<ext>.",
+      "examples": [
+        {
+          "name": "cover uploaded (shape from the handler; not called live, see meta.verified)",
+          "status": 200,
+          "response": {
+            "success": true,
+            "data": {
+              "cover_image_url": "<signed R2 GET URL for communities/<community_id>/events/<event_id>/cover/20261023205526-cover.png, expires in 600 s>"
+            }
+          }
+        }
+      ],
+      "errors": [
+        { "status": 400, "when": "event_id is not a UUID", "body": { "success": false, "error": "Invalid event ID" } },
+        { "status": 400, "when": "No multipart part named 'file' (or the body is not multipart)", "body": { "success": false, "error": "No file provided" } },
+        { "status": 400, "when": "File larger than 5 MB", "body": { "success": false, "error": "Image must be under 5MB" } },
+        { "status": 400, "when": "File is empty or not a JPG / PNG / WebP / GIF", "body": { "success": false, "error": "Image must be a JPG, PNG, WebP or GIF" } },
+        { "status": 401, "when": "No or invalid access token (verified live)", "body": { "success": false, "error": "Authentication required" } },
+        { "status": 403, "when": "Logged in, but not as a solver", "body": { "success": false, "error": "You do not have permission to access this resource" } },
+        { "status": 403, "when": "The caller does not own the event's community, or the event is platform-wide", "body": { "success": false, "error": "You are not authorized to perform this action" } },
+        { "status": 403, "when": "The community is archived or locked", "body": { "success": false, "error": "Community is not active" } },
+        { "status": 404, "when": "No event with this id", "body": { "success": false, "error": "Event not found" } },
+        { "status": 404, "when": "The event's community no longer exists", "body": { "success": false, "error": "Community not found" } },
+        { "status": 409, "when": "The event has ended or was cancelled", "body": { "success": false, "error": "artwork can only be changed before the event ends" } },
+        { "status": 500, "when": "Storage unavailable, or the R2 upload / database write failed (an uploaded file is cleaned up)", "body": { "success": false, "error": "Failed to upload cover" } },
+        { "status": 503, "code": "MAINTENANCE_MODE", "when": "Maintenance mode is on (this path is not exempt)", "body": "see maintenance_mode_behaviour.blocked_response" }
+      ]
+    }
+  ]
+}

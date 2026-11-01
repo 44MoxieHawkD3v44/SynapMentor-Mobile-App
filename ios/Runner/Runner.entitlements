@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Push notifications. Xcode uses the production environment when the app is archived for release. -->
+	<key>aps-environment</key>
+	<string>development</string>
+	<!-- Screen sharing: the ScreenShare extension hands the screen over through this group. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.synapmentor.app</string>
+	</array>
+</dict>
+</plist>

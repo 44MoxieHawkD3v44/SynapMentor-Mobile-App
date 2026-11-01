@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- HTTPS everywhere, except the API host while it is served over plain HTTP.
+     Remove the domain-config once the API has HTTPS. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">213.199.40.111</domain>
+    </domain-config>
+</network-security-config>

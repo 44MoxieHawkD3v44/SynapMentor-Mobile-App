@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1094141361113",
+    "project_id": "synapmentor4444",
+    "storage_bucket": "synapmentor4444.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1094141361113:android:a1d93bacdb5e8533a837c8",
+        "android_client_info": {
+          "package_name": "com.synapmentor.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDGwXWxiRHxjY7SFQ-O3nM2BjffRH8NpXU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
